@@ -1,5 +1,6 @@
 import { posix } from "node:path";
 
+import { logicalPathNfc } from "../domain/artifactIdentity.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 
@@ -31,7 +32,7 @@ export const normalizeArtifactPath = (input: string): string => {
       "path",
       `Artifact path is absolute or unsafe: ${JSON.stringify(input)}`,
     );
-  const normalized = input.normalize("NFC").replace(/\/+$/u, "");
+  const normalized = logicalPathNfc(input).replace(/\/+$/u, "");
   const parts = normalized.split("/");
   if (
     normalized.length === 0 ||
@@ -176,12 +177,12 @@ const englishUnicodeCaseCollisions = (
     if (path.length === 0 || path === ".") continue;
     let node = root;
     for (const part of path.split("/")) {
-      const folded = englishCaseFold(part);
-      const spellings = node.spellingsByFold.get(folded);
-      if (spellings === undefined) node.spellingsByFold.set(folded, [part]);
-      else if (!spellings.includes(part)) spellings.push(part);
       let child = node.bySpelling.get(part);
       if (child === undefined) {
+        const folded = englishCaseFold(part);
+        const spellings = node.spellingsByFold.get(folded);
+        if (spellings === undefined) node.spellingsByFold.set(folded, [part]);
+        else spellings.push(part);
         child = emptyCaseNode();
         node.bySpelling.set(part, child);
       }

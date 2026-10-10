@@ -11,6 +11,8 @@ export interface FakeCdpBrowser {
   readonly browserWebSocketUrl: string;
   readonly allowedOrigin: string;
   readonly commands: readonly FakeCdpCommand[];
+  /** Actual WebSocket connections still held by the wire fixture. */
+  activeConnectionCount(): number;
   /** Deliver actual malformed wire data without bypassing the production transport parser. */
   emitRawMessage(message: string): void;
   emitEvent(event: {
@@ -28,6 +30,8 @@ export interface FakeCdpBrowser {
 }
 
 export interface FakeOptions {
+  /** Send these commands' producer events before acknowledging completion, as a wire barrier. */
+  readonly eventsBeforeReply?: readonly string[];
   /** Return a native-shaped command rejection through the actual wire parser. */
   readonly commandError?: (
     command: FakeCdpCommand,

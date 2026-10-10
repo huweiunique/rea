@@ -6,6 +6,10 @@ import { uniqueSorted } from "../canonicalOrdering.js";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import { canonicalJsonDigestSteps } from "../canonicalJsonDigestSteps.js";
 import { freezeOwnedJsonSnapshotSteps } from "../immutableJson.js";
+import {
+  arrayContainerSchema,
+  parseElementSteps,
+} from "../zodCollectionSteps.js";
 import type {
   ApplicationGraphEvidence,
   ApplicationGraphEvidenceContext,
@@ -15,15 +19,11 @@ import {
   JAVASCRIPT_SEMANTIC_RELATION_FAMILIES,
   JAVASCRIPT_SEMANTIC_RELATION_FAMILY,
   javaScriptSemanticFingerprintInputSchema,
-  javaScriptSemanticFingerprintSchema,
   javaScriptSemanticGraphInputSchema,
   javaScriptSemanticGraphRecordSchema,
   javaScriptSemanticNodeInputSchema,
-  javaScriptSemanticNodeSchema,
   javaScriptSemanticRelationInputSchema,
-  javaScriptSemanticRelationSchema,
   javaScriptSemanticUnknownInputSchema,
-  javaScriptSemanticUnknownSchema,
   type JavaScriptSemanticGraphInput,
   type JavaScriptSemanticGraphNode,
   type JavaScriptSemanticGraphRelation,
@@ -128,10 +128,10 @@ export const createJavaScriptSemanticGraphNode = (
     application_node_ids: uniqueSorted(parsed.application_node_ids),
     evidence: evidenceContexts.intern(parsed.evidence),
   };
-  return javaScriptSemanticNodeSchema.parse({
+  return {
     ...semantic,
     node_id: javaScriptSemanticNodeId(semantic),
-  });
+  };
 };
 
 /** Normalize one semantic relationship and derive its exact identifier. */
@@ -144,10 +144,10 @@ export const createJavaScriptSemanticGraphRelation = (
     ...parsed,
     evidence: evidenceContexts.intern(parsed.evidence),
   };
-  return javaScriptSemanticRelationSchema.parse({
+  return {
     ...semantic,
     relation_id: `jsrg_relation_${digestCanonicalValue(semantic, "JavaScript semantic graph")}`,
-  });
+  };
 };
 
 /** Normalize one unresolved semantic frontier and derive its identifier. */
@@ -162,10 +162,10 @@ export const createJavaScriptSemanticGraphUnknown = (
     candidate_node_ids: uniqueSorted(parsed.candidate_node_ids),
     evidence: evidenceContexts.intern(parsed.evidence),
   };
-  return javaScriptSemanticUnknownSchema.parse({
+  return {
     ...semantic,
     unknown_id: `jsrg_unknown_${digestCanonicalValue(semantic, "JavaScript semantic graph")}`,
-  });
+  };
 };
 
 /** Normalize one function fingerprint and derive its component commitment. */
@@ -187,7 +187,7 @@ export const createJavaScriptSemanticFingerprint = (
     semantic.components,
     "JavaScript semantic graph",
   );
-  return javaScriptSemanticFingerprintSchema.parse({
+  return {
     ...semantic,
     fingerprint_sha256: fingerprintSha256,
     fingerprint_id: `jsrg_fingerprint_${digestCanonicalValue(
@@ -198,7 +198,7 @@ export const createJavaScriptSemanticFingerprint = (
       },
       "JavaScript semantic graph",
     )}`,
-  });
+  };
 };
 
 type GraphRecord = z.infer<typeof javaScriptSemanticGraphRecordSchema>;
@@ -765,6 +765,15 @@ export const createJavaScriptSemanticGraph = (
 
 const validatedImmutableSemanticGraphs = new WeakSet<object>();
 
+const semanticGraphShape = javaScriptSemanticGraphInputSchema.shape;
+const semanticGraphContainerSchema = javaScriptSemanticGraphInputSchema.extend({
+  evidence_contexts: arrayContainerSchema(semanticGraphShape.evidence_contexts),
+  nodes: arrayContainerSchema(semanticGraphShape.nodes),
+  relations: arrayContainerSchema(semanticGraphShape.relations),
+  fingerprints: arrayContainerSchema(semanticGraphShape.fingerprints),
+  unknowns: arrayContainerSchema(semanticGraphShape.unknowns),
+});
+
 /** Clone input synchronously; commit, check and seal the owned graph in steps. */
 export const createImmutableJavaScriptSemanticGraphSteps = (
   input: unknown,
@@ -772,6 +781,58 @@ export const createImmutableJavaScriptSemanticGraphSteps = (
   validateAndSealSemanticGraphSteps(
     normalizeGraphInput(javaScriptSemanticGraphInputSchema.parse(input)),
   );
+
+/**
+ * Seal a graph whose input the caller transfers: the caller neither retains nor
+ * mutates any part of it afterwards. Only the graph's own fields are validated
+ * synchronously; collection elements are validated and cloned in steps, because
+ * a whole-graph parse of a large application held the event loop for seconds.
+ */
+export const sealTransferredJavaScriptSemanticGraphSteps = (
+  input: unknown,
+): Generator<void, JavaScriptSemanticGraph> =>
+  parseAndSealSemanticGraphSteps(semanticGraphContainerSchema.parse(input));
+
+function* parseAndSealSemanticGraphSteps(
+  container: z.output<typeof semanticGraphContainerSchema>,
+): Generator<void, JavaScriptSemanticGraph> {
+  const issues: z.core.$ZodIssue[] = [];
+  const parsed: JavaScriptSemanticGraphInput = {
+    ...container,
+    evidence_contexts: yield* parseElementSteps(
+      semanticGraphShape.evidence_contexts.element,
+      container.evidence_contexts,
+      ["evidence_contexts"],
+      issues,
+    ),
+    nodes: yield* parseElementSteps(
+      semanticGraphShape.nodes.element,
+      container.nodes,
+      ["nodes"],
+      issues,
+    ),
+    relations: yield* parseElementSteps(
+      semanticGraphShape.relations.element,
+      container.relations,
+      ["relations"],
+      issues,
+    ),
+    fingerprints: yield* parseElementSteps(
+      semanticGraphShape.fingerprints.element,
+      container.fingerprints,
+      ["fingerprints"],
+      issues,
+    ),
+    unknowns: yield* parseElementSteps(
+      semanticGraphShape.unknowns.element,
+      container.unknowns,
+      ["unknowns"],
+      issues,
+    ),
+  };
+  if (issues.length > 0) throw new z.ZodError(issues);
+  return yield* validateAndSealSemanticGraphSteps(normalizeGraphInput(parsed));
+}
 
 function* validateAndSealSemanticGraphSteps(
   semantic: JavaScriptSemanticGraphInput,
