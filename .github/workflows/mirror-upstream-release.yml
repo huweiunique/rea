@@ -51,13 +51,14 @@ jobs:
           opener = urllib.request.build_opener(NoRedirect)
           
           def request(url, method='GET', data=None, authenticated=False, binary=False):
-              headers = {'User-Agent': 'rea-upstream-package-mirror', 'Accept': 'application/vnd.github+json'}
+              headers = {'User-Agent': 'rea-upstream-package-mirror', 'Accept': 'application/octet-stream' if binary else 'application/json'}
               host = urllib.parse.urlsplit(url)
               if host.scheme != 'https' or host.username or host.password:
                   raise RuntimeError('Invalid HTTPS destination')
               if authenticated:
                   if host.netloc not in ('api.github.com', 'uploads.github.com'):
                       raise RuntimeError('Refusing credentials to non-GitHub API')
+                  headers['Accept'] = 'application/vnd.github+json'
                   headers['Authorization'] = 'Bearer ' + os.environ['GH_TOKEN']
                   headers['X-GitHub-Api-Version'] = '2022-11-28'
               if data is not None:
