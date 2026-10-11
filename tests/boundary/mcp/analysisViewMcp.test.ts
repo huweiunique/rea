@@ -1,5 +1,6 @@
 import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import { STDIO_DEFAULT_MAX_BUFFER_SIZE } from "@modelcontextprotocol/server";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { expect, it, onTestFinished } from "vitest";
 import { z } from "zod";
@@ -7,6 +8,8 @@ import { z } from "zod";
 import { BinaryLayoutService } from "../../../src/application/binaryDiagnostics/BinaryLayoutService.js";
 import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
+import { createAnalysisProfile } from "../../../src/domain/analysisProfile.js";
+import { jsonObjectSchema } from "../../../src/domain/jsonValue.js";
 import { functionDossierSchema } from "../../../src/domain/hopperValues.js";
 import { ghidraFunctionDossier } from "../../../src/domain/ghidraValues.fixture.js";
 import { ok } from "../../../src/domain/result.js";
@@ -15,6 +18,7 @@ import {
   createJavaScriptApplicationNode,
 } from "../../../src/domain/javascript/javascriptApplicationGraph.js";
 import { createServer } from "../../../src/server/createServer.js";
+import { connectGhidraMcp } from "./ghidraMcpHarness.js";
 import {
   analysisViewJavaScriptEvidence,
   analysisViewJavaScriptAnalysisWithSource,
@@ -45,6 +49,115 @@ const connect = async (binaryLayout?: BinaryLayoutService) => {
   await client.connect(clientTransport);
   return { client, session };
 };
+
+it("discovers an oversized native dossier by exact metadata and reads its retained view", async () => {
+  const { client, session } = await connect();
+  const provider = { id: "ghidra", name: "Ghidra", version: "12.1.4" };
+  const profile = createAnalysisProfile(provider, { language: "fixture" });
+  const parent = createEvidence(
+    { path: "/fixtures/large.exe", format: "pe", sha256: "a".repeat(64) },
+    provider,
+    {
+      operation: "analyze_function",
+      parameters: { procedure: "0x401000" },
+      analysisProfile: profile,
+      result: {
+        ...jsonObjectSchema.parse(ghidraFunctionDossier()),
+        pseudocode: "x".repeat(6 * 1024 * 1024),
+      },
+      rawResult: null,
+    },
+  );
+  const other = createEvidence(
+    { path: "/fixtures/other.exe", format: "pe", sha256: "b".repeat(64) },
+    provider,
+    {
+      operation: "analyze_function",
+      parameters: {},
+      result: ghidraFunctionDossier(),
+    },
+  );
+  for (const record of [parent, other]) {
+    const retained = session.recordEvidence(record);
+    if (!retained.ok) throw retained.error;
+  }
+  const broad = await client.callTool({
+    name: "get_evidence_bundle",
+    arguments: {},
+  });
+  const broadError = parseMcpToolError(broad).error;
+  expect(broadError.code).toBe("resource_constraint");
+  expect(broadError.remediation?.action).toContain(
+    "get_evidence_bundle and detail: summary",
+  );
+  const response = await client.callTool({
+    name: "get_evidence_bundle",
+    arguments: {
+      detail: "summary",
+      filters: {
+        operation: "analyze_function",
+        target_sha256: "a".repeat(64),
+        analysis_profile_digest: profile.digest,
+        procedure_address: "0x401000",
+      },
+    },
+  });
+  expect(response.isError).not.toBe(true);
+  const result = toolContract("get_evidence_bundle").outputSchema.parse(
+    response.structuredContent,
+  ).result;
+  expect(result).toMatchObject({
+    kind: "evidence-bundle-summary",
+    total_retained_records: 2,
+    matching_records: 1,
+    records: [
+      {
+        evidence_id: parent.evidence_id,
+        analysis_profile_digest: profile.digest,
+        retention: "complete-record",
+        native_dossier: { available: true, procedure_address: "0x401000" },
+      },
+    ],
+  });
+  expect(JSON.stringify(response)).not.toContain("pseudocode");
+  expect(
+    JSON.parse(response.content.find((c) => c.type === "text")?.text ?? "null"),
+  ).toEqual(response.structuredContent);
+  const page = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: {
+      source: { kind: "retained-evidence", evidence_id: parent.evidence_id },
+      view: { kind: "native", facet: "pseudocode", offset: 0, limit: 32 },
+    },
+  });
+  expect(page.isError).not.toBe(true);
+  expect(
+    toolContract("inspect_analysis_view").outputSchema.parse(
+      page.structuredContent,
+    ).normalized_result,
+  ).toMatchObject({
+    item: { text: "x".repeat(32) },
+    coverage: { total: 6 * 1024 * 1024, exhausted: false },
+  });
+  const empty = await client.callTool({
+    name: "get_evidence_bundle",
+    arguments: {
+      detail: "summary",
+      filters: { evidence_id: `ev_${"e".repeat(64)}` },
+    },
+  });
+  expect(
+    toolContract("get_evidence_bundle").outputSchema.parse(
+      empty.structuredContent,
+    ).result,
+  ).toMatchObject({ matching_records: 0, records: [] });
+  await client.ping();
+  const invalid = await client.callTool({
+    name: "get_evidence_bundle",
+    arguments: { filters: { operation: "analyze_function" } },
+  });
+  expect(parseMcpToolError(invalid).error.code).toBe("invalid_request");
+});
 
 it("advertises exact schemas and projects one layout section from retained Evidence", async () => {
   const layout = analysisViewLayoutFixture();
@@ -342,6 +455,95 @@ it("retains an oversized native assembly row and permits a subsequent smaller vi
     parent_evidence_id: parent.evidence_id,
   });
   await client.ping();
+});
+
+it("reads successive native source pages directly from a completed-result transport error", async () => {
+  const pseudocode = "int fixture_add(int a, int b) { return a + b; }\n".repeat(
+    150_000,
+  );
+  const harness = await connectGhidraMcp(
+    "native-continuation",
+    async (operation) => {
+      if (operation !== "analyze_function")
+        throw new Error(`Unexpected provider operation: ${operation}`);
+      return ok({
+        value: {
+          ...functionDossierSchema.parse(ghidraFunctionDossier()),
+          pseudocode,
+        },
+        limitations: [],
+      });
+    },
+  );
+  onTestFinished(() => harness.close());
+  const { mcp: client, session, calls } = harness;
+  const failed = await client.callTool({
+    name: "analyze_function",
+    arguments: { procedure: "0x401000" },
+  });
+  expect(failed.isError).toBe(true);
+  const limits = z
+    .object({
+      error: z.object({
+        details: z.object({ reported_limits: jsonObjectSchema }),
+      }),
+    })
+    .parse(parseMcpToolError(failed)).error.details.reported_limits;
+  const reference = z
+    .object({
+      kind: z.literal("retained-evidence"),
+      evidence_id: z.string(),
+    })
+    .parse(limits.evidence_reference);
+  const parent = parseEvidence(session.evidenceById(reference.evidence_id));
+  expect(parent.operation).toBe("analyze_function");
+  expect(parent.parameters).toMatchObject({ procedure: "0x401000" });
+  const call = z
+    .object({
+      name: z.literal("inspect_analysis_view"),
+      arguments: toolContract("inspect_analysis_view").inputSchema,
+    })
+    .parse(limits.continuation);
+  expect(call.arguments.source).toEqual({
+    kind: "retained-evidence",
+    evidence_id: parent.evidence_id,
+  });
+  const first = await client.callTool(call);
+  expect(first.isError).not.toBe(true);
+  const page = toolContract("inspect_analysis_view").outputSchema.parse(
+    first.structuredContent,
+  ).normalized_result;
+  expect(page).toMatchObject({
+    parent_evidence_id: parent.evidence_id,
+    item: { text: pseudocode.slice(0, 64) },
+    coverage: { examined: 64, next_offset: 64, exhausted: false },
+  });
+  expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThan(
+    STDIO_DEFAULT_MAX_BUFFER_SIZE,
+  );
+  const second = await client.callTool({
+    name: call.name,
+    arguments: {
+      ...call.arguments,
+      view: {
+        kind: "native",
+        facet: "pseudocode",
+        offset: page.coverage.next_offset,
+        limit: 64,
+      },
+    },
+  });
+  expect(second.isError).not.toBe(true);
+  expect(
+    toolContract("inspect_analysis_view").outputSchema.parse(
+      second.structuredContent,
+    ).normalized_result,
+  ).toMatchObject({ item: { text: pseudocode.slice(64, 128) } });
+  expect(
+    session.evidenceById(parent.evidence_id)?.normalized_result,
+  ).toMatchObject({ pseudocode });
+  await client.ping();
+  expect(calls).toEqual(["analyze_function"]);
 });
 
 it("returns a JavaScript summary without graph payloads from a retained reference", async () => {

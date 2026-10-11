@@ -1,7 +1,6 @@
 import type { ExecutableFormatHint } from "../domain/dosCom.js";
+import type { BinaryArchitecture } from "../domain/binaryTargetTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
-import { EnhancedTools } from "./EnhancedTools.js";
-import { executeFunctionAnalysisEvidence } from "./FunctionAnalysisEvidence.js";
 import type { DirectAnalysisDependencies } from "./DirectAnalysisDependencies.js";
 import type { BinarySession } from "./binary/BinarySession.js";
 import type { SessionProviderRoute } from "./binary/SessionProviderRouter.js";
@@ -16,14 +15,14 @@ import {
   isManagedToolName,
   type ManagedToolName,
 } from "../contracts/managed/managedToolContracts.js";
-import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { type AnalysisError } from "../domain/analysisErrorBase.js";
-import { access } from "node:fs/promises";
 import {
-  readAnalysisSnapshot,
-  writeAnalysisSnapshot,
-} from "./binary/AnalysisSnapshotFiles.js";
+  EvidenceFileError,
+  EvidenceIntegrityError,
+} from "../domain/evidenceErrors.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { access } from "node:fs/promises";
+import { readAnalysisSnapshot } from "./binary/AnalysisSnapshotFiles.js";
 import { parseBinaryTarget } from "./BinaryTargetResolver.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
@@ -93,6 +92,8 @@ export const runDirectAnalysis = async (
     readonly signal?: AbortSignal;
     readonly providerId?: AnalysisProviderSelector;
     readonly formatHint?: ExecutableFormatHint;
+    readonly architecture?: BinaryArchitecture;
+    readonly entryPoint?: string;
   } = {},
 ): Promise<JsonValue> =>
   withProcessCancellation(options.signal, (signal) =>
@@ -103,6 +104,12 @@ export const runDirectAnalysis = async (
       ...(options.formatHint === undefined
         ? {}
         : { formatHint: options.formatHint }),
+      ...(options.architecture === undefined
+        ? {}
+        : { architecture: options.architecture }),
+      ...(options.entryPoint === undefined
+        ? {}
+        : { entryPoint: options.entryPoint }),
       ...(options.providerId === undefined
         ? {}
         : { providerId: options.providerId }),
@@ -138,7 +145,7 @@ export const runManagedProviderExecution = async (
   signal?: AbortSignal,
 ): Promise<Result<AnalysisExecution, AnalysisError>> =>
   withProcessCancellation(signal, async (operationSignal) => {
-    const session = dependencies.createManagedBinarySession();
+    const session = await dependencies.createManagedBinarySession();
     return withSessionCleanup(
       session,
       async () => {
@@ -170,6 +177,9 @@ const runManagedProviderAnalysis = async (
     result: value.result,
     rawResult: value.rawResult,
     limitations: value.limitations,
+    ...(value.relationshipCoverage === undefined
+      ? {}
+      : { relationshipCoverage: value.relationshipCoverage }),
     locations: value.locations,
   });
 };
@@ -189,12 +199,14 @@ const runAnalysis = async (
     readonly signal: AbortSignal;
     readonly providerId?: AnalysisProviderSelector;
     readonly formatHint?: ExecutableFormatHint;
+    readonly architecture?: BinaryArchitecture;
+    readonly entryPoint?: string;
   },
 ): Promise<JsonValue> => {
   const { logger, signal, snapshotPath } = options;
   const config = dependencies.readConfiguration();
   if (!config.ok) return cliError(config.error);
-  const session = dependencies.createBinarySession(config.value, logger);
+  const session = await dependencies.createBinarySession(config.value, logger);
   return withSessionCleanup(
     session,
     async () => {
@@ -205,6 +217,12 @@ const runAnalysis = async (
         ...(options.formatHint === undefined
           ? {}
           : { formatHint: options.formatHint }),
+        ...(options.architecture === undefined
+          ? {}
+          : { architecture: options.architecture }),
+        ...(options.entryPoint === undefined
+          ? {}
+          : { entryPoint: options.entryPoint }),
       });
       if (!prepared.ok) return cliError(prepared.error);
       const { snapshot } = prepared.value;
@@ -216,6 +234,12 @@ const runAnalysis = async (
           ...(options.formatHint === undefined
             ? {}
             : { formatHint: options.formatHint }),
+          ...(options.architecture === undefined
+            ? {}
+            : { architecture: options.architecture }),
+          ...(options.entryPoint === undefined
+            ? {}
+            : { entryPoint: options.entryPoint }),
           ...(options.providerId === undefined
             ? {}
             : { providerId: options.providerId }),
@@ -248,6 +272,12 @@ const runAnalysis = async (
         ...(options.formatHint === undefined
           ? {}
           : { formatHint: options.formatHint }),
+        ...(options.architecture === undefined
+          ? {}
+          : { architecture: options.architecture }),
+        ...(options.entryPoint === undefined
+          ? {}
+          : { entryPoint: options.entryPoint }),
         ...(snapshot === undefined ? {} : { snapshot }),
         ...(options.providerId === undefined
           ? {}
@@ -304,13 +334,19 @@ const runAnalysis = async (
         const snapshot = session.exportAnalysisSnapshot();
         if (!snapshot.ok)
           return cliError(snapshot.error.retainPartialObservation(evidence));
-        const written = await writeAnalysisSnapshot(
+        const written = await session.writeAnalysisSnapshot(
           snapshot.value,
           snapshotPath,
           true,
         );
-        if (!written.ok)
-          return cliError(written.error.retainPartialObservation(evidence));
+        if (!written.ok) {
+          const recovered =
+            written.error instanceof EvidenceFileError &&
+            written.error.published !== undefined &&
+            (await session.closeWriteResources()).ok;
+          if (!recovered)
+            return cliError(written.error.retainPartialObservation(evidence));
+        }
       }
       return output;
     },
@@ -332,6 +368,8 @@ const executeAnalysisTool = async (input: {
 }): Promise<{ readonly output: JsonValue; readonly evidence?: Evidence }> => {
   const { session, tool, signal, evidenceProfile } = input;
   if (tool === "analyze_function") {
+    const { executeFunctionAnalysisEvidence } =
+      await import("./FunctionAnalysisEvidence.js");
     const result = await executeFunctionAnalysisEvidence(
       session,
       input.arguments,
@@ -350,6 +388,7 @@ const executeAnalysisTool = async (input: {
     tool === "trace_native_values" ||
     tool === "trace_native_ui_action"
   ) {
+    const { EnhancedTools } = await import("./EnhancedTools.js");
     const result = await new EnhancedTools(session).execute(
       tool,
       input.arguments,
@@ -406,6 +445,9 @@ const executeAnalysisTool = async (input: {
         : { analysisProfile: result.value.analysisProfile }),
       rawResult: result.value.rawResult,
       limitations: result.value.limitations,
+      ...(result.value.relationshipCoverage === undefined
+        ? {}
+        : { relationshipCoverage: result.value.relationshipCoverage }),
       locations: result.value.locations,
       evidenceLinks:
         tool === "inspect_artifact"
@@ -439,6 +481,8 @@ const withProcessCancellation = async <Value>(
 const prepareSnapshot = async (options: {
   readonly path: string;
   readonly formatHint?: ExecutableFormatHint;
+  readonly architecture?: BinaryArchitecture;
+  readonly entryPoint?: string;
   readonly snapshotPath: string | undefined;
   readonly signal: AbortSignal;
 }): Promise<
@@ -450,13 +494,19 @@ const prepareSnapshot = async (options: {
   const { path, snapshotPath } = options;
   if (snapshotPath === undefined || !(await fileExists(snapshotPath)))
     return ok({});
-  const loaded = await readAnalysisSnapshot(snapshotPath);
+  const loaded = await readAnalysisSnapshot(snapshotPath, options.signal);
   if (!loaded.ok) return loaded;
   const target = await parseBinaryTarget(path, {
     signal: options.signal,
     ...(options.formatHint === undefined
       ? {}
       : { formatHint: options.formatHint }),
+    ...(options.architecture === undefined
+      ? {}
+      : { architecture: options.architecture }),
+    ...(options.entryPoint === undefined
+      ? {}
+      : { entryPoint: options.entryPoint }),
   });
   if (!target.ok) return target;
   if (!snapshotMatchesTarget(loaded.value.target, target.value))
