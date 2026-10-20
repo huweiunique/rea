@@ -1,4 +1,5 @@
 import * as t from "@babel/types";
+import { RETURNED_REFERENCE_WIDENING_LIMITATION } from "./javascriptSemanticCoverage.js";
 import { collectElectronWrappedCallPaths } from "./electronWrappedCallPaths.js";
 import {
   ELECTRON_IDENTITY_LIMITATION,
@@ -11,6 +12,7 @@ import {
 } from "./javascriptSemanticTraversal.js";
 
 import { inspectElectronStaticNode } from "./electronStaticAnalysis.js";
+import { finishElectronBrowserWindowsSteps } from "./electronStaticAnalysisBrowser.js";
 import {
   detectVendors,
   failedJavaScriptStaticAnalysis,
@@ -21,10 +23,14 @@ import {
 import {
   addReference,
   addSourceMapDirectives,
+  finishPartialNetworkEndpoints,
+  finishSqliteStorageCalls,
   inspectCall,
   inspectRouteProperty,
   inspectRoleProperty,
   inspectRpcNode,
+  finishRpcScanSteps,
+  indexVitePreloadDependencyTable,
 } from "./javascriptStaticAnalysisCalls.js";
 import {
   inspectBundlerRegistration,
@@ -41,10 +47,7 @@ import type { JavaScriptStaticAnalysis } from "./javascriptStaticAnalysisTypes.j
 import type { JavaScriptSemanticAnalysisState } from "./javascriptSemanticState.js";
 import {
   indexJavaScriptElectronIdentitySteps,
-  indexJavaScriptBindingsSteps,
-  classifyParsedJavaScriptRpcClientRootsSteps,
-  classifyParsedJavaScriptOpenReceivers,
-  type JavaScriptOpenReceiverFact,
+  indexJavaScriptBindingsWithReceiversSteps,
 } from "./javascriptSemanticAnalysis.js";
 import {
   parseJavaScriptSource,
@@ -52,7 +55,12 @@ import {
 } from "./javascriptSourceParser.js";
 
 import { createJavaScriptRpcScan } from "./javascriptRpcEndpoints.js";
-import { semanticImportEqualsSpecifier } from "./javascriptSemanticProjection.js";
+import {
+  hasUncertainTypeOnlyModuleSideEffect,
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyImportDeclaration,
+  semanticImportEqualsSpecifier,
+} from "./javascriptModuleDeclaration.js";
 
 /** Parse one JavaScript artifact and recover static structure only. */
 export const analyzeJavaScriptStaticSource = (
@@ -61,47 +69,48 @@ export const analyzeJavaScriptStaticSource = (
   const file = parseJavaScriptSource(source);
   return file === null
     ? failedJavaScriptStaticAnalysis()
-    : analyzeParsedJavaScriptStaticSource(
-        source,
-        file,
-        classifyParsedJavaScriptOpenReceivers(file),
-      );
+    : analyzeParsedJavaScriptStaticSource(source, file);
 };
 
 /** Recover static structure from an already parsed JavaScript artifact. */
 export const analyzeParsedJavaScriptStaticSource = (
   source: string,
   file: ParsedJavaScriptSource,
-  openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
 ): JavaScriptStaticAnalysis =>
-  completeSemanticSteps(
-    analyzeParsedJavaScriptStaticSourceSteps(source, file, openReceiverFacts),
-  );
+  completeSemanticSteps(analyzeParsedJavaScriptStaticSourceSteps(source, file));
 
 /** Static analysis that yields during its source traversal; results are unchanged. */
 export function* analyzeParsedJavaScriptStaticSourceSteps(
   source: string,
   file: ParsedJavaScriptSource,
-  openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
 ): Generator<void, JavaScriptStaticAnalysis> {
   const accumulator = createJavaScriptAnalysisAccumulator(source.length);
-  const bindings = yield* indexJavaScriptBindingsSteps(file.program);
+  // One definitions pass serves receiver classification and binding lookup.
+  const index = yield* indexJavaScriptBindingsWithReceiversSteps(file.program);
+  const { bindings, receivers } = index;
+  yield* index.indexAmbientWritesSteps();
   const electronIdentity = yield* indexJavaScriptElectronIdentitySteps(
     file.program,
     bindings,
   );
-  const clientRoots = yield* classifyParsedJavaScriptRpcClientRootsSteps(file);
-  yield* traverseStaticSourceSteps(
-    file,
-    {
-      source,
-      accumulator,
-      ...(openReceiverFacts === undefined ? {} : { openReceiverFacts }),
-      electronBindings: electronIdentity.bindings,
-      rpcScan: createJavaScriptRpcScan(source, clientRoots),
-    },
-    bindings,
-  );
+  const findings: JavaScriptFindingContext = {
+    source,
+    accumulator,
+    vitePreloadDependencyTable: indexVitePreloadDependencyTable(file.program),
+    openReceiverFacts: receivers.openReceivers,
+    electronBindings: electronIdentity.bindings,
+    rpcScan: createJavaScriptRpcScan(source, receivers.rpcClientRoots, index),
+  };
+  yield* traverseStaticSourceSteps(file, findings, bindings);
+  yield* finishElectronBrowserWindowsSteps(findings, index);
+  if (
+    accumulator.pendingNetworkCalls.length > 0 ||
+    accumulator.pendingSqliteCalls.length > 0
+  ) {
+    yield* index.indexMemberMutationFactsSteps();
+    finishPartialNetworkEndpoints(findings, bindings, index);
+    finishSqliteStorageCalls(findings, bindings, index);
+  }
   accumulator.electronCallPaths = collectElectronWrappedCallPaths(
     file.program,
     bindings,
@@ -110,7 +119,7 @@ export function* analyzeParsedJavaScriptStaticSourceSteps(
     electronIdentity,
   );
   addSourceMapDirectives(source, file.comments ?? [], accumulator);
-  return finalizeStaticAnalysis(source, file, accumulator);
+  return finalizeStaticAnalysis(source, file, accumulator, bindings);
 }
 
 function* traverseStaticSourceSteps(
@@ -125,15 +134,20 @@ function* traverseStaticSourceSteps(
       return undefined;
     },
   });
+  yield* finishRpcScanSteps(findings);
 }
 
 const finalizeStaticAnalysis = (
   source: string,
   file: ParsedJavaScriptSource,
   accumulator: AnalysisAccumulator,
+  bindings: JavaScriptSemanticAnalysisState,
 ): JavaScriptStaticAnalysis => {
   const parserErrors = file.errors.length;
   const limitations = [
+    ...(bindings.returnedReferenceWidenings.size > 0
+      ? [RETURNED_REFERENCE_WIDENING_LIMITATION]
+      : []),
     ...(accumulator.electronCallPaths?.length
       ? [
           "Bundled Electron call paths use static argument and closure substitutions. Conditions, ambient helper overrides, runtime reachability and arbitrary side effects remain unproven.",
@@ -154,6 +168,11 @@ const finalizeStaticAnalysis = (
       : [
           "One or more static keys, expressions, or Electron boundary values were dynamic and remain unknown.",
         ]),
+    ...(hasUncertainTypeOnlyModuleSideEffect(file.program)
+      ? [
+          "Compiler options are unavailable; inline type-only imports or re-exports may preserve a module side-effect dependency.",
+        ]
+      : []),
     ...(accumulator.references.some(
       ({ value }) =>
         value.specifier !== null && ELECTRON_MODULE.test(value.specifier),
@@ -246,14 +265,20 @@ const inspectNode = (
       addReference(findings, { node, kind: "require", specifier });
   } else if (
     (t.isImportDeclaration(node) || t.isExportAllDeclaration(node)) &&
-    node.source !== undefined
+    node.source !== undefined &&
+    !(t.isImportDeclaration(node) && isTypeOnlyImportDeclaration(node)) &&
+    !(t.isExportAllDeclaration(node) && isTypeOnlyExportDeclaration(node))
   )
     addReference(findings, {
       node,
       kind: "static-import",
       specifier: node.source.value,
     });
-  else if (t.isExportNamedDeclaration(node) && node.source != null)
+  else if (
+    t.isExportNamedDeclaration(node) &&
+    node.source != null &&
+    !isTypeOnlyExportDeclaration(node)
+  )
     addReference(findings, {
       node,
       kind: "static-import",

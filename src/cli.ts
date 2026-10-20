@@ -4,13 +4,17 @@ import { registerWasmCommands } from "./cli/wasmCommands.js";
 import { snapshotEnvironment } from "./process/snapshotEnvironment.js";
 import { createDirectAnalysis } from "./composition/directAnalysis.js";
 import { registerEvmCommands } from "./cli/evmCommands.js";
+import { registerDesktopApplicationCommands } from "./cli/desktopApplicationCommands.js";
 import { registerGoCommands } from "./cli/goCommands.js";
+import { registerIl2cppCommands } from "./cli/il2cppCommands.js";
+import { registerRustCommands } from "./cli/rustCommands.js";
 import { registerSqliteCommands } from "./cli/sqliteCommands.js";
 import { registerAnalysisViewCommands } from "./cli/analysisViewCommands.js";
 import { registerBinaryDiagnosticsCommands } from "./cli/binaryDiagnosticsCommands.js";
 import { registerFridaCommands } from "./cli/fridaCommands.js";
 import type { FridaInstrumentationPort } from "./application/frida/FridaInstrumentationPort.js";
 import { Cli } from "incur";
+import { normalizeCliArguments } from "./cliOutput.js";
 
 import { createLogger, parseLogLevel } from "./logger.js";
 import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
@@ -24,10 +28,12 @@ import { registerManagedCommands } from "./cli/managedCommands.js";
 import { registerFirmwareCommands } from "./cli/firmwareCommands.js";
 import { registerAndroidCommands } from "./cli/androidCommands.js";
 import { registerApktoolCommands } from "./cli/apktoolCommands.js";
+import { registerPcapCommands } from "./cli/pcapCommands.js";
 import { registerFlutterCommands } from "./cli/flutterCommands.js";
 import { registerJebCommands } from "./cli/jebCommands.js";
 import { registerAdbCommands } from "./cli/adbCommands.js";
 import { registerEvidenceCommands } from "./cliEvidenceCommands.js";
+import { registerEnvironmentCommands } from "./cli/environmentCommands.js";
 import { registerProcessCommands } from "./cli/processCommands.js";
 import { registerBrowserCommands } from "./cli/browserCommands.js";
 import { registerWebScriptCommands } from "./cli/webScriptCommands.js";
@@ -47,6 +53,8 @@ import {
   streamCliCommandResults,
   type CliResultOutput,
 } from "./cli/cliResultOutput.js";
+import { registerReverseEngineeringCommands } from "./cli/reverseEngineeringCommands.js";
+import { registerCutterCommands } from "./cli/cutterCommands.js";
 
 /** Describe CLI settings that are invalid before any command runs, as MCP does. */
 export const cliConfigurationError = (
@@ -90,21 +98,36 @@ export const createCli = (
         "Ask what software, artifact, protocol, or behavior the user wants to understand, then choose the available investigation capabilities that can produce evidence.",
     },
     sync: false,
+    update: {
+      // Incur's update:false only suppresses notices. Reject its explicit
+      // installer so ambiguous flags cannot bypass REA's verified workflow.
+      install: () => {
+        throw new Error(
+          "Use 'rea update' to update the identified installation. The '--update' alias accepts only global output flags.",
+        );
+      },
+    },
   });
 
   registerSetupCommands(cli, logger, environment);
+  registerReverseEngineeringCommands(cli, logger, environment);
+  registerCutterCommands(cli, logger, environment);
   registerCoreAnalysisCommands(cli, logger, analysis.runDirectAnalysis);
   registerUtilityCommands(cli, logger, environment, analysis);
   registerWasmCommands(cli, logger, environment);
   registerCaptureCommands(cli, logger, environment);
   registerSignalCommands(cli, logger, environment);
   registerEvmCommands(cli, logger, environment);
+  registerDesktopApplicationCommands(cli, logger);
   registerGoCommands(cli, logger);
+  registerIl2cppCommands(cli, logger);
+  registerRustCommands(cli, logger);
   registerSqliteCommands(cli, logger, environment);
   registerArtifactCommands(cli, logger, analysis.runProviderAnalysis);
   registerManagedCommands(cli, logger, analysis.runProviderAnalysis);
   registerAndroidCommands(cli, logger, environment);
   registerApktoolCommands(cli, logger, environment);
+  registerPcapCommands(cli, logger, environment);
   registerFlutterCommands(cli, logger);
   registerJebCommands(cli, logger, environment);
   registerAdbCommands(cli, logger, environment);
@@ -113,6 +136,7 @@ export const createCli = (
   registerAnalysisViewCommands(cli, logger);
   registerFridaCommands(cli, logger, fridaInstrumentation);
   registerEvidenceCommands(cli, logger);
+  registerEnvironmentCommands(cli, logger, environment);
   registerProcessCommands(cli, logger, environment);
   registerBrowserCommands(cli, logger);
   registerWebScriptCommands(cli, logger);
@@ -128,5 +152,8 @@ export const createCli = (
   registerApplicationCommands(cli, logger);
   presentOmittableDefaults(cli);
   if (resultOutput !== undefined) streamCliCommandResults(cli, resultOutput);
+  const serve = cli.serve.bind(cli);
+  cli.serve = (arguments_ = process.argv.slice(2), options) =>
+    serve(normalizeCliArguments(arguments_), options);
   return cli;
 };

@@ -6,7 +6,9 @@ import { FridaInstrumentationService } from "../application/frida/FridaInstrumen
 import type { FridaInstrumentationPort } from "../application/frida/FridaInstrumentationPort.js";
 import type { FridaRemoteConnection } from "../application/frida/FridaInstrumentationPort.js";
 import { toolContract } from "../contracts/toolContracts.js";
+import type { ToolContract } from "../contracts/toolContractTypes.js";
 import { evidenceSchema } from "../domain/evidence.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { logToolExecution } from "./toolLogging.js";
@@ -40,22 +42,7 @@ export const registerFridaTools = (
       const result = await logToolExecution(logger, listDevices.name, () =>
         service.listDevices(remoteConnection(input.remote)),
       );
-      return result.ok
-        ? delivery.toCallToolResult(
-            {
-              ok: true,
-              value: jsonValueSchema.parse({
-                devices: result.value.devices.map((device) => ({
-                  device_id: device.deviceId,
-                  name: device.name,
-                  type: device.type,
-                })),
-                cleanup_error: result.value.cleanupError,
-              }),
-            },
-            listDevices,
-          )
-        : delivery.toCallToolResult(result, listDevices);
+      return delivery.toCallToolResult(result, listDevices);
     },
   );
   server.registerTool(
@@ -71,19 +58,7 @@ export const registerFridaTools = (
           ...(remote === undefined ? {} : { remote }),
         }),
       );
-      return result.ok
-        ? delivery.toCallToolResult(
-            {
-              ok: true,
-              value: jsonValueSchema.parse({
-                device_id: result.value.deviceId,
-                processes: result.value.processes,
-                cleanup_error: result.value.cleanupError,
-              }),
-            },
-            listProcesses,
-          )
-        : delivery.toCallToolResult(result, listProcesses);
+      return delivery.toCallToolResult(result, listProcesses);
     },
   );
   server.registerTool(
@@ -121,8 +96,12 @@ export const registerFridaTools = (
               }),
       );
       if (!result.ok) {
-        recordPartialEvidence(result.error, recordEvidence);
-        return delivery.toCallToolResult(result, start);
+        return deliverPartialEvidenceError(
+          result,
+          start,
+          delivery,
+          recordEvidence,
+        );
       }
       return delivery.toCallToolResult(
         {
@@ -136,24 +115,39 @@ export const registerFridaTools = (
   server.registerTool(
     load.name,
     toolRegistrationOptions(load),
-    async (input) => {
+    async (input, context: ServerContext) => {
       const result = await logToolExecution(logger, load.name, () =>
         input.source_kind === "inline" && input.source !== undefined
-          ? service.loadScript(input.session_id, {
-              sourceKind: "inline",
-              source: input.source,
-            })
+          ? service.loadScript(
+              input.session_id,
+              {
+                sourceKind: "inline",
+                source: input.source,
+              },
+              context.mcpReq.signal,
+            )
           : input.source_kind === "file" && input.path !== undefined
-            ? service.loadScript(input.session_id, {
-                sourceKind: "file",
-                path: input.path,
-              })
+            ? service.loadScript(
+                input.session_id,
+                {
+                  sourceKind: "file",
+                  path: input.path,
+                },
+                context.mcpReq.signal,
+              )
             : Promise.resolve({
                 ok: false as const,
                 error: new AnalysisInputError(load.name),
               }),
       );
-      if (!result.ok) return delivery.toCallToolResult(result, load);
+      if (!result.ok) {
+        return deliverPartialEvidenceError(
+          result,
+          load,
+          delivery,
+          recordEvidence,
+        );
+      }
       return delivery.toEvidenceToolResult(
         result.value,
         load,
@@ -164,9 +158,9 @@ export const registerFridaTools = (
   server.registerTool(
     resume.name,
     toolRegistrationOptions(resume),
-    async (input) => {
+    async (input, context: ServerContext) => {
       const result = await logToolExecution(logger, resume.name, () =>
-        service.resumeSession(input.session_id),
+        service.resumeSession(input.session_id, context.mcpReq.signal),
       );
       return result.ok
         ? delivery.toCallToolResult(
@@ -179,9 +173,13 @@ export const registerFridaTools = (
   server.registerTool(
     unload.name,
     toolRegistrationOptions(unload),
-    async (input) => {
+    async (input, context: ServerContext) => {
       const result = await logToolExecution(logger, unload.name, () =>
-        service.unloadScript(input.session_id, input.script_id),
+        service.unloadScript(
+          input.session_id,
+          input.script_id,
+          context.mcpReq.signal,
+        ),
       );
       return result.ok
         ? delivery.toCallToolResult(
@@ -280,8 +278,12 @@ export const registerFridaTools = (
         () => operation,
       );
       if (!result.ok) {
-        recordPartialEvidence(result.error, recordEvidence);
-        return delivery.toCallToolResult(result, instrument);
+        return deliverPartialEvidenceError(
+          result,
+          instrument,
+          delivery,
+          recordEvidence,
+        );
       }
       return delivery.toEvidenceToolResult(
         result.value.evidence,
@@ -292,13 +294,21 @@ export const registerFridaTools = (
   );
 };
 
-const recordPartialEvidence = (
-  error: { readonly partialObservation?: unknown },
+const deliverPartialEvidenceError = (
+  result: { readonly ok: false; readonly error: AnalysisError },
+  contract: ToolContract,
+  delivery: ToolResultDelivery,
   recordEvidence: EvidenceWriter["recordEvidence"] | undefined,
-): void => {
-  if (error.partialObservation === undefined) return;
-  const parsed = evidenceSchema.safeParse(error.partialObservation);
-  if (parsed.success) recordEvidence?.(parsed.data);
+): ReturnType<ToolResultDelivery["toCallToolResult"]> => {
+  const parsed = evidenceSchema.safeParse(result.error.partialObservation);
+  if (!parsed.success || recordEvidence === undefined)
+    return delivery.toCallToolResult(result, contract);
+  return delivery.toRecordedPartialErrorToolResult(
+    result.error,
+    parsed.data.evidence_id,
+    recordEvidence(parsed.data),
+    contract.returnsTargetContent,
+  );
 };
 
 const remoteConnection = (
