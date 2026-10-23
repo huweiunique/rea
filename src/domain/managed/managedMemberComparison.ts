@@ -10,6 +10,8 @@ import {
 } from "./managedArtifact.js";
 import {
   buildComparisonCoverage,
+  hasCompleteMethodRows,
+  selectedDeclaringTypes,
   buildComparisonMatching,
   buildComparisonSummary,
   comparisonLimitations,
@@ -132,8 +134,11 @@ const methodComparisonItemSchema = comparisonItemSchema(
         "cil",
         "opcode-shape",
         "call-shape",
+        "call-target",
         "field-shape",
+        "field-target",
         "exception-shape",
+        "exception-target",
         "availability",
         "body-coverage",
       ]),
@@ -212,10 +217,42 @@ export interface ManagedMemberComparisonSide {
   readonly result: ManagedMemberInspection;
 }
 
-const selectedTypes = (
+const callEdgesByCaller = (
   result: ManagedMemberInspection,
-): ReadonlySet<string> | null =>
-  result.selection === null ? null : new Set(result.selection.type_names);
+): ReadonlyMap<
+  string,
+  readonly ManagedMemberInspection["call_edges"][number][]
+> => {
+  const edges = new Map<
+    string,
+    ManagedMemberInspection["call_edges"][number][]
+  >();
+  for (const edge of result.call_edges) {
+    const callerEdges = edges.get(edge.caller_token);
+    if (callerEdges === undefined) edges.set(edge.caller_token, [edge]);
+    else callerEdges.push(edge);
+  }
+  return edges;
+};
+
+const fieldAccessesByCaller = (
+  result: ManagedMemberInspection,
+): ReadonlyMap<
+  string,
+  readonly ManagedMemberInspection["field_accesses"][number][]
+> => {
+  const accesses = new Map<
+    string,
+    ManagedMemberInspection["field_accesses"][number][]
+  >();
+  for (const access of result.field_accesses) {
+    const callerAccesses = accesses.get(access.method_token);
+    if (callerAccesses === undefined)
+      accesses.set(access.method_token, [access]);
+    else callerAccesses.push(access);
+  }
+  return accesses;
+};
 
 /** Compare managed members with constrained exact and structural identities. */
 export const compareManagedMembers = (
@@ -228,11 +265,23 @@ export const compareManagedMembers = (
     rightEvidenceId: right.evidenceId,
     leftComplete: left.result.metadata.status === "complete",
     rightComplete: right.result.metadata.status === "complete",
-    leftSelection: selectedTypes(left.result),
-    rightSelection: selectedTypes(right.result),
+    leftMethodsComplete:
+      left.result.metadata.status === "complete" &&
+      hasCompleteMethodRows(left.result),
+    rightMethodsComplete:
+      right.result.metadata.status === "complete" &&
+      hasCompleteMethodRows(right.result),
+    leftSelection: selectedDeclaringTypes(left.result),
+    rightSelection: selectedDeclaringTypes(right.result),
     signatureResolutionExamined:
       hasSignatureResolution(left.result) &&
       hasSignatureResolution(right.result),
+    leftAssembly: left.result.assembly,
+    rightAssembly: right.result.assembly,
+    leftCallEdgesByCaller: callEdgesByCaller(left.result),
+    rightCallEdgesByCaller: callEdgesByCaller(right.result),
+    leftFieldAccessesByCaller: fieldAccessesByCaller(left.result),
+    rightFieldAccessesByCaller: fieldAccessesByCaller(right.result),
   };
   const methodItems = buildMethodItems(methodMatches, itemContext);
   const fieldItems = buildFieldItems(fieldMatches, itemContext);
