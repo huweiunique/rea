@@ -1,4 +1,4 @@
-import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { clearClientLocationEnvironment } from "../../fixtures/clientEnvironment.js";
 
-import { readClientRegistrationStatuses } from "../../../src/application/ClientRegistrationStatus.js";
+import {
+  readClientRegistrationInspections,
+  readClientRegistrationStatuses,
+} from "../../../src/application/ClientRegistrationStatus.js";
+import { configureClientConfiguration } from "../../../src/application/SetupClientConfiguration.js";
 import { classifyClientRegistrationCommand } from "../../../src/application/ClientRegistrationIdentity.js";
 import { existingMaintenanceScope } from "../../../src/application/UpdateMaintenance.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
@@ -179,6 +183,14 @@ describe("client registration launcher identity", () => {
       state: "unknown",
       remediation: expect.stringContaining("registration was retained"),
     });
+    expect(status).not.toHaveProperty("commandIdentity");
+    expect(await readClientRegistrationInspections(home, "")).toEqual([
+      expect.objectContaining({
+        status,
+        activation: "enabled",
+        commandIdentity: "unknown",
+      }),
+    ]);
   });
 
   it("does not use the REA process cwd to resolve a client's relative launcher path", async () => {
@@ -229,7 +241,9 @@ describe("client registration launcher identity", () => {
       state: "unknown",
     });
   });
+});
 
+describe("client registration package version identity", () => {
   it.each([
     ["4.1.0", true],
     ["v4.1.0", false],
@@ -402,6 +416,46 @@ describe("client activation keys", () => {
           environment: { XDG_CONFIG_HOME: join(home, ".config") },
         }),
       ).toEqual([expect.objectContaining({ client, state })]);
+    },
+  );
+});
+
+describe("Ghidra multi-function deadline registration advice", () => {
+  it.each([
+    { provider: "ghidra", timeout: 10, hasBatchScope: true },
+    { provider: "ghidra", timeout: 1800, hasBatchScope: true },
+    { provider: "hopper", timeout: 1800, hasBatchScope: false },
+  ])(
+    "preserves a selected $timeout-second $provider deadline and describes its scope",
+    async ({ provider, timeout, hasBatchScope }) => {
+      const home = await createTestTempDirectory("rea-codex-decompile-scope-");
+      await mkdir(join(home, ".codex"));
+      const entry = resolve("scripts/rea.mjs");
+      const configPath = join(home, ".codex/config.toml");
+      // Two 600-second Ghidra decompiles plus startup/headroom would need an
+      // estimated 1650 seconds. A caller's shorter or longer choice stays theirs.
+      const original = `[mcp_servers.rea]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(entry)}, "mcp"]\nstartup_timeout_sec = 30\ntool_timeout_sec = ${timeout}\n[mcp_servers.rea.env]\nREA_ANALYSIS_PROVIDER = "${provider}"\nREA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS = "600"\n`;
+      await writeFile(configPath, original);
+      const [status] = await readClientRegistrationStatuses(home, entry, {
+        environment: {},
+      });
+      expect(status).toMatchObject({ client: "codex", state: "aligned" });
+      if (hasBatchScope) {
+        expect(status?.advisory).toContain("single-decompile estimate");
+        expect(status?.advisory).toContain("every attempted function");
+        expect(status?.advisory).toContain("trace_native_values");
+        expect(status?.advisory).toContain("max_functions");
+      } else expect(status?.advisory).toBeUndefined();
+      const configured = await configureClientConfiguration(
+        { name: "codex", format: "toml", configPath },
+        {},
+        [process.execPath, entry, "mcp"],
+      );
+      expect(configured).toMatchObject({ status: "unchanged" });
+      expect(await readFile(configPath, "utf8")).toBe(original);
+      await expect(readFile(`${configPath}.rea.backup`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     },
   );
 });

@@ -4,6 +4,7 @@ import {
   ArtifactFileCleanupFailure,
   withArtifactRegularFile,
 } from "../../artifacts/ArtifactFileOperation.js";
+import { fileSnapshotPartialObservationSchema } from "../../domain/fileSnapshotObservation.js";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
 import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import { OwnedDirectoryHandle } from "../../filesystem/OwnedDirectoryHandle.js";
@@ -64,9 +65,8 @@ const scanRecoveryFile = async (
       path,
       resources ?? new ArtifactResourceScope(),
       signal,
-      async (handle) => {
+      async ({ handle, initial: before }) => {
         const hash = createHash("sha256");
-        const before = await handle.stat();
         if (before.size > maximum)
           throw new RecoveryFileSizeError(
             `Expected a regular file no larger than ${String(maximum)} bytes: ${path}`,
@@ -100,11 +100,17 @@ const scanRecoveryFile = async (
       },
     );
   } catch (cause: unknown) {
-    if (
-      cause instanceof ArtifactFileCleanupFailure ||
-      cause instanceof ArtifactFileCancelled
-    )
-      throw cause;
+    if (cause instanceof ArtifactFileCleanupFailure) throw cause;
+    if (cause instanceof ArtifactFileCancelled)
+      throw new AnalysisCancelledError(OPERATION, {
+        cause: cause.fileCancellation.reason,
+        partialObservation: fileSnapshotPartialObservationSchema.parse(
+          Object.assign({}, cause.fileCancellation.outcome.value, {
+            kind: "file-snapshot-hash",
+            path,
+          }),
+        ),
+      });
     if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
       throw new AnalysisCancelledError(OPERATION, {
         cause: artifactFileCancellationCause(cause),
@@ -182,8 +188,7 @@ const snapshotRecoveryInput = async (
       cause instanceof AnalysisCancelledError ||
       cause instanceof AnalysisAccessDeniedError ||
       cause instanceof AnalysisArtifactChangedError ||
-      cause instanceof ArtifactFileCleanupFailure ||
-      cause instanceof ArtifactFileCancelled
+      cause instanceof ArtifactFileCleanupFailure
     )
       throw cause;
     // The operation-wide input allowance is a deterministic byte budget, not
