@@ -1,3 +1,4 @@
+import type { CdpContextFrameClaim } from "./CdpScriptContextFacts.js";
 import type { InspectWebPageInput } from "../domain/browserObservation.js";
 import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
@@ -12,9 +13,13 @@ export interface CdpCaptureEventsState {
   rejectedSourceMapMetadataBudgetCount: number;
   readonly scriptMetadataBytesById: Map<string, number>;
   retainedScriptMetadataBytes: number;
-  /** Console-entry and websocket-frame bytes admitted against the shared retained-event budget. */
+  /** Console, websocket-frame and selected request/response shape outputs share one allowance. */
   retainedEventBytes: number;
-  readonly executionContextFrames: Map<string, string>;
+  readonly bodyShapeBytesByRequestId: Map<
+    string,
+    { readonly request: number; readonly response: number }
+  >;
+  readonly executionContextFrames: Map<string, CdpContextFrameClaim>;
   readonly network: Map<string, NetworkState>;
   readonly networkRequestTimestamps: Map<string, number>;
   readonly malformedRedirectRequestIds: Set<string>;

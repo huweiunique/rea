@@ -2,7 +2,6 @@ name: Real Ghidra Windows E2E
 
 on:
   workflow_dispatch:
-
 env:
   HUSKY: "0"
   # Writes only on the default branch for push, schedule, manual dispatch,
