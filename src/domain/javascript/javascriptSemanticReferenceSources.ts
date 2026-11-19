@@ -1,18 +1,17 @@
-import type * as t from "@babel/types";
+import * as t from "@babel/types";
 import type { JavaScriptSemanticAnalysisState } from "./javascriptSemanticState.js";
 import {
   semanticArrayIndex,
-  semanticPropertyPathKeyMatches,
+  type JavaScriptSemanticPropertySelection,
   type JavaScriptSemanticPropertyPath as PropertyPath,
 } from "./javascriptSemanticPropertyPaths.js";
-import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import {
   evaluateSemanticExpression,
   semanticValueDefinitelyDefined,
 } from "./javascriptSemanticValues.js";
 import { semanticSlotAtPath } from "./javascriptSemanticSlots.js";
 import type { JavaScriptSemanticValue } from "./javascriptSemanticValueTypes.js";
-import { semanticEffectTiming } from "./javascriptSemanticMutationInitializers.js";
+import { ambientPathMayObserveAt } from "./javascriptSemanticEffectLog.js";
 
 /**
  * Node's wrapper module inherits require. A copy cannot read that delegate
@@ -21,21 +20,13 @@ import { semanticEffectTiming } from "./javascriptSemanticMutationInitializers.j
 export const semanticCommonJsRequireOwnEnumerableAt = (
   capture: t.Node,
   state: JavaScriptSemanticAnalysisState,
-): boolean => {
-  const selected = ["commonjs-module", "require"];
-  const mayAffect = (
-    effect: JavaScriptSemanticAnalysisState["ambientWriteEffects"][number],
-  ) =>
-    effect.path.length <= selected.length &&
-    effect.path.every((key, index) =>
-      semanticPropertyPathKeyMatches(key, selected[index] ?? ""),
-    ) &&
-    semanticEffectTiming(capture, effect.node, state) !== "after";
-  return (
-    state.ambientWriteEffects.some(mayAffect) ||
-    state.ambientEscapeEffects.some(mayAffect)
+): boolean =>
+  ambientPathMayObserveAt(
+    state,
+    capture,
+    ["commonjs-module", "require"],
+    "contents",
   );
-};
 
 interface ReferenceSource {
   readonly node: t.Node;
@@ -43,14 +34,87 @@ interface ReferenceSource {
   readonly iterationSources?: readonly ReferenceSource[];
 }
 
+/** Shared intrinsic reached through a native array iterator's prototype. */
+export const semanticArrayIteratorPrototypePath = [
+  "array-iterator-prototype",
+] as const;
+const arrayIteratorNextPath = [
+  ...semanticArrayIteratorPrototypePath,
+  "next",
+] as const;
+
 /** Native array iteration preserves numeric slots only while its iterator is intact. */
 export const semanticKnownArrayIteration = (
   value: JavaScriptSemanticValue | undefined,
   state: JavaScriptSemanticAnalysisState,
-): boolean =>
+  read: t.Node,
+): value is Extract<JavaScriptSemanticValue, { status: "array" }> =>
   !state.arrayIterationUnknown &&
   value?.status === "array" &&
+  !ambientPathMayObserveAt(state, read, arrayIteratorNextPath, "contents") &&
   value.items.every((item) => semanticArrayIndex(item.name) !== null);
+
+const arrayIteratorReturnPaths = [
+  [...semanticArrayIteratorPrototypePath, "return"],
+  [...semanticArrayIteratorPrototypePath, "__proto__", "return"],
+  [...semanticArrayIteratorPrototypePath, "__proto__", "__proto__", "return"],
+  ["global", "Iterator", "prototype", "return"],
+  ["global", "Object", "prototype", "return"],
+] as const;
+
+/** References a possible native close hook can still obtain by advancing its iterator. */
+export const semanticArrayPatternCloseSelection = (
+  pattern: t.ArrayPattern,
+  owner: t.Node | undefined,
+  array: Extract<JavaScriptSemanticValue, { status: "array" }>,
+  state: JavaScriptSemanticAnalysisState,
+): JavaScriptSemanticPropertySelection | undefined => {
+  if (
+    !arrayIteratorReturnPaths.some((path) =>
+      ambientPathMayObserveAt(state, pattern, path, "contents"),
+    )
+  )
+    return undefined;
+  const declaration =
+    owner === undefined ? undefined : state.parentsByNode.get(owner);
+  const last = pattern.elements.at(-1);
+  const hasRest = t.isRestElement(last);
+  let consumed = 0;
+  if (
+    t.isVariableDeclarator(owner) &&
+    t.isVariableDeclaration(declaration) &&
+    (declaration.kind === "const" || declaration.kind === "let")
+  ) {
+    for (const [index, element] of pattern.elements.entries()) {
+      // A lexical rest drains the iterator only after earlier pattern work
+      // reaches it. A preceding default or nested binding can throw first.
+      if (hasRest && element === last) return undefined;
+      const slot = array.items[index];
+      const ownSlot =
+        consumed === index &&
+        slot?.name === String(index) &&
+        slot.presence === "present";
+      if (
+        element !== null &&
+        !t.isIdentifier(element) &&
+        !(
+          hasRest &&
+          owner.id === pattern &&
+          ownSlot &&
+          t.isAssignmentPattern(element) &&
+          t.isIdentifier(element.left) &&
+          semanticValueDefinitelyDefined(slot.value)
+        )
+      )
+        break;
+      if (ownSlot) consumed += 1;
+      else if (!hasRest) break;
+    }
+  }
+  // The literal suffix can be empty while the iterator still has references
+  // from stored writes. Resolve those separately at the close site.
+  return { excludedKeys: [], startIndex: consumed };
+};
 
 /** Invocation spreads use the same native-iteration proof at their source read. */
 export const semanticKnownArrayIterationAt = (
@@ -60,6 +124,7 @@ export const semanticKnownArrayIterationAt = (
   semanticKnownArrayIteration(
     evaluateSemanticExpression(node, state, node),
     state,
+    node,
   );
 
 /** Numeric destructuring projections do not select slots of custom iterators. */
@@ -85,8 +150,7 @@ const selectedReferenceIterationKnown = (
         // inventory can prove every possible nested iterable without treating
         // a computed object property or custom iterator as an own-index read.
         if (
-          !semanticKnownArrayIteration(value, state) ||
-          value.status !== "array" ||
+          !semanticKnownArrayIteration(value, state, source.node) ||
           value.unknownItems
         )
           return false;
@@ -102,7 +166,9 @@ const selectedReferenceIterationKnown = (
     }
     values = [...selected];
   }
-  return values.every((value) => semanticKnownArrayIteration(value, state));
+  return values.every((value) =>
+    semanticKnownArrayIteration(value, state, source.node),
+  );
 };
 
 /** Exclude references whose source slot or destructuring fallback is absent. */
@@ -146,56 +212,4 @@ export const semanticSelectedReferenceSlot = (
     evaluateSemanticExpression(source.node, state, capturePoint),
     path,
   );
-};
-
-interface CopiedReferenceSource {
-  readonly projection: PropertyPath;
-  readonly copyKind?: "object-rest" | "array-rest";
-  readonly copyProjectionOffset?: number;
-  readonly copyExcludedKeys?: readonly string[];
-  readonly copyStartIndex?: number;
-}
-
-/** Map copied child selections once; the fresh copy itself keeps its own identity. */
-export const semanticCopiedReferencePath = (
-  initializer: CopiedReferenceSource,
-  path: PropertyPath,
-  effect: "write" | "escape" | "identity",
-): PropertyPath | null => {
-  const offset = initializer.copyProjectionOffset;
-  if (offset === undefined) return [...initializer.projection, ...path];
-  const copiedPath = [...initializer.projection.slice(offset + 1), ...path];
-  if (effect === "identity" && copiedPath.length === 0) return null;
-  if (effect === "write" && copiedPath.length < 2) return null;
-  let [key, ...remaining] = copiedPath;
-  if (initializer.copyKind === "array-rest") {
-    const startIndex = initializer.copyStartIndex ?? 0;
-    if (key === undefined || key === null)
-      key = { excludedKeys: [], startIndex };
-    else if (typeof key === "object")
-      key = {
-        excludedKeys: key.excludedKeys.flatMap((name) => {
-          const index = semanticArrayIndex(name);
-          return index === null ? [] : [String(index + startIndex)];
-        }),
-        startIndex: (key.startIndex ?? 0) + startIndex,
-      };
-    else {
-      const index = semanticArrayIndex(key);
-      if (index === null) return null;
-      key = index + startIndex;
-    }
-  } else {
-    const excludedKeys = initializer.copyExcludedKeys ?? [];
-    if (key === undefined || key === null) key = { excludedKeys };
-    else if (typeof key === "object")
-      key = {
-        ...key,
-        excludedKeys: [...new Set([...key.excludedKeys, ...excludedKeys])].sort(
-          compareUnicodeCodePoints,
-        ),
-      };
-    else if (excludedKeys.includes(String(key))) return null;
-  }
-  return [...initializer.projection.slice(0, offset), key, ...remaining];
 };

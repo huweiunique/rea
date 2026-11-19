@@ -2,6 +2,7 @@ name: Full PR qualification
 
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
   actions: read
