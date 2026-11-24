@@ -1,6 +1,6 @@
 /**
  * The effect log: one owner of the questions readers ask about recorded
- * effects (docs/adr/javascript/pushed-effect-invalidation.md). Readers ask
+ * effects. Readers ask
  * whether a read may observe an effect; the timing, capture and path proofs
  * stay here. Recorded opaque sites live in javascriptSemanticEffectRecord.ts.
  */
@@ -11,6 +11,7 @@ import {
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
+  semanticArrayIndex,
   semanticPropertyPathKeyMatches,
   type JavaScriptSemanticPropertyPath,
 } from "./javascriptSemanticPropertyPaths.js";
@@ -44,6 +45,7 @@ import {
   type JavaScriptSemanticMemberEffect,
   type JavaScriptSemanticReferenceEffectsAtSite,
 } from "./javascriptSemanticState.js";
+import { semanticConsumerMemo } from "./javascriptSemanticConsumer.js";
 
 export const indexSemanticOpaqueEffects = (
   candidates: readonly {
@@ -146,7 +148,7 @@ export const createSemanticOpaqueGlobalObserver = (
 };
 
 /** Global code can affect globals, but cannot rebind its caller's locals. */
-const semanticOpaqueGlobalMayHaveChanged = (
+export const semanticOpaqueGlobalMayHaveChanged = (
   read: t.Node,
   state: JavaScriptSemanticAnalysisState,
 ): boolean =>
@@ -377,21 +379,50 @@ export const semanticEffectMayFollow = (
 type AmbientEffect =
   JavaScriptSemanticAnalysisState["ambientWriteEffects"][number];
 
+/** Which effects on the native prototype chain can alter array iteration. */
+export const semanticArrayPrototypeIterationMayChange = (
+  path: JavaScriptSemanticPropertyPath,
+): boolean => {
+  let offset = 0;
+  while (path[offset] === "constructor" && path[offset + 1] === "prototype")
+    offset += 2;
+  const key = path[offset];
+  return (
+    key === undefined ||
+    key === null ||
+    typeof key === "object" ||
+    semanticArrayIndex(key) !== null ||
+    key === "__proto__"
+  );
+};
+
+/** Seed the iteration guard from the earlier, alias-aware ambient effect index. */
+export const semanticAmbientArrayIterationUnknown = (
+  state: JavaScriptSemanticAnalysisState,
+): boolean => {
+  const changesIteration = ({ path }: AmbientEffect): boolean =>
+    path[0] === "global" &&
+    (path[1] === "Array" || path[1] === "Object" || path[1] === null) &&
+    (path[2] === "prototype" || path[2] === null) &&
+    semanticArrayPrototypeIterationMayChange(path.slice(3));
+  return (
+    state.ambientWriteEffects.some(changesIteration) ||
+    state.ambientEscapeEffects.some(changesIteration)
+  );
+};
+
 type MemberWrite = JavaScriptSemanticBindingState["memberWrites"][number];
 
 /** Matching effects per queried path; the effect lists only grow, so their
  * lengths tell when a retained selection is stale. */
-const ambientPathSelections = new WeakMap<
-  JavaScriptSemanticAnalysisState,
-  {
-    writes: number;
-    escapes: number;
-    readonly byPath: Map<
-      string,
-      { readonly writes: AmbientEffect[]; readonly escapes: AmbientEffect[] }
-    >;
-  }
->();
+const ambientPathSelections = semanticConsumerMemo<{
+  writes: number;
+  escapes: number;
+  readonly byPath: Map<
+    string,
+    { readonly writes: AmbientEffect[]; readonly escapes: AmbientEffect[] }
+  >;
+}>();
 
 const ambientPathEffects = (
   state: JavaScriptSemanticAnalysisState,
@@ -997,15 +1028,55 @@ const opaqueCodeMayReachBindingReference = (
 ): boolean =>
   semanticBindingMayHaveOpaqueEffect(binding, state, capturePoint, "reference");
 
+/** Whether a binding can acquire members outside its retained assignment sources. */
+export const bindingHasUnmodeledMemberValues = (
+  binding: JavaScriptSemanticBindingState,
+  write: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+): boolean => {
+  if (opaqueCodeMayReachBindingReference(binding, state, undefined))
+    return true;
+  if (
+    binding.memberWrites.some((effect) => effect.assignedSources === undefined)
+  )
+    return true;
+  // The queried store itself can mark its selected slot escaped. Its retained
+  // RHS still participates in the source proof.
+  const storeIsModeled = binding.memberWrites.some(
+    (effect) => effect.node === write,
+  );
+  return binding.escapedPaths.some(
+    (effect) => effect.node !== write || !storeIsModeled,
+  );
+};
+
+const inactiveMemberWriteNodes = new WeakMap<
+  JavaScriptSemanticAnalysisState,
+  WeakSet<t.Node>
+>();
+
+export const retainSemanticInactiveMemberWrites = (
+  state: JavaScriptSemanticAnalysisState,
+  nodes: readonly t.Node[],
+): void => {
+  inactiveMemberWriteNodes.set(state, new WeakSet(nodes));
+};
+
 const observesCapturedWrite = (
   binding: JavaScriptSemanticBindingState,
   capture: t.Node | undefined,
   node: t.Node | undefined,
-  parents: JavaScriptSemanticAnalysisState["parentsByNode"],
+  state: JavaScriptSemanticAnalysisState,
 ): boolean =>
-  capture === undefined ||
   node === undefined ||
-  !semanticBindingEffectFollowsCapture(binding, capture, node, parents);
+  (inactiveMemberWriteNodes.get(state)?.has(node) !== true &&
+    (capture === undefined ||
+      !semanticBindingEffectFollowsCapture(
+        binding,
+        capture,
+        node,
+        state.parentsByNode,
+      )));
 
 const observesCapturedEscape = (
   binding: JavaScriptSemanticBindingState,
@@ -1031,12 +1102,7 @@ export const capturedBindingPathMayHaveChanged = (
       path,
       (effect) =>
         semanticEffectPathMatches(effect.path, path) &&
-        observesCapturedWrite(
-          binding,
-          capture,
-          effect.node,
-          state.parentsByNode,
-        ),
+        observesCapturedWrite(binding, capture, effect.node, state),
     ) ||
     semanticSomeEffectPathCandidate(
       binding.escapedPaths,
@@ -1101,7 +1167,7 @@ export const applySemanticBindingReferenceEffects = (
     value,
     binding.memberWrites
       .filter(({ node }) =>
-        observesCapturedWrite(binding, capturePoint, node, state.parentsByNode),
+        observesCapturedWrite(binding, capturePoint, node, state),
       )
       .map(({ path }) => path),
   );
