@@ -79,7 +79,9 @@ export const UNIT_LAYERS = Object.freeze(
       "model",
       "native",
       "nuget",
+      "vsix",
       "objdump",
+      "oci",
       "pcap",
       "python",
       "reference",
@@ -366,6 +368,7 @@ export const ENTRY_FILES = Object.freeze(
         "pe/PeImportsProvider.ts",
         "pe/PeLoadConfigProvider.ts",
         "pe/PeUnwindRangesProvider.ts",
+        "pe/PeOverlayProvider.ts",
         "pe/PeResourcesProvider.ts",
         "pwntools/PwntoolsDecoder.ts",
         "pwntools/PwntoolsLayoutProvider.ts",
@@ -374,7 +377,9 @@ export const ENTRY_FILES = Object.freeze(
         "windows/WindowsShortcutProvider.ts",
       ],
       nuget: ["NugetNupkgProvider.ts", "NugetNupkgProviderIdentity.ts"],
+      vsix: ["VsixPackageProvider.ts", "VsixPackageProviderIdentity.ts"],
       objdump: ["ObjdumpCommand.ts", "ObjdumpProviderIdentity.ts"],
+      oci: ["OciImageLayoutProvider.ts", "OciImageLayoutProviderIdentity.ts"],
       pcap: [
         "PcapConfiguration.ts",
         "PcapProvider.ts",
@@ -431,6 +436,13 @@ const isEntryFile = (unit, target) =>
  * still is. Keep the list short and say why.
  */
 export const PROVIDER_DEPENDENCIES = Object.freeze([
+  Object.freeze({
+    from: "artifacts",
+    to: "native",
+    files: Object.freeze(["pe/PeUnsignedDigest.ts"]),
+    reason:
+      "ASAR inventory explains PE Authenticode signed-after-packing integrity mismatches",
+  }),
   Object.freeze({
     from: "artifacts",
     to: "uefi",

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { completeOrUnknownCoverageSchema } from "../coverage.js";
+import { QUALCOMM_MBN_INLINE_SEGMENT_HASH_LIMIT } from "../qualcommMbnImage.js";
 import {
   byteRange,
   offset,
@@ -549,3 +550,120 @@ export const uImageEntryMetadataSchema = z.strictObject({
   index: uint32,
 });
 export type UImageEntryMetadata = z.infer<typeof uImageEntryMetadataSchema>;
+
+/**
+ * uClinux bFLT flat header facts (all fields big-endian). Header offsets count
+ * from the start of the file. Revision 4 relocation entries count from the
+ * byte after the header and are listed up to a fixed inline count; the full
+ * table stays extractable.
+ */
+export const bfltMetadataSchema = z.strictObject({
+  kind: z.literal("bflt"),
+  revision: uint32,
+  entry: uint32,
+  data_start: uint32,
+  data_end: uint32,
+  bss_end: uint32,
+  stack_size: uint32,
+  reloc_start: uint32,
+  reloc_count: uint32,
+  flags: uint32,
+  flag_names: z.array(z.string()),
+  unknown_flags: uint32,
+  build_date: uint32.nullable(),
+  build_date_iso: z.string().nullable(),
+  compression: z.enum(["none", "gzip", "gzdata"]),
+  text_size: offset.nullable(),
+  data_size: offset.nullable(),
+  bss_size: offset.nullable(),
+  inflated_bytes: offset.nullable(),
+  relocations: z.array(uint32),
+  relocations_truncated: z.boolean(),
+  out_of_range_relocation_count: offset.nullable(),
+});
+export type BfltMetadata = z.infer<typeof bfltMetadataSchema>;
+
+/** One bFLT segment: its range in the loader's (inflated) image. */
+export const bfltSegmentMetadataSchema = z.strictObject({
+  kind: z.literal("bflt-segment"),
+  segment: z.enum(["text", "data", "relocations", "compressed-body"]),
+  image_offset: offset.nullable(),
+  length: offset,
+});
+export type BfltSegmentMetadata = z.infer<typeof bfltSegmentMetadataSchema>;
+
+const qualcommMbnRangeSchema = z.strictObject({
+  offset,
+  length: offset,
+});
+
+/**
+ * Qualcomm MBN header facts. Pointers are declared words; ranges are the
+ * file offsets REA derived from the header position and region sizes.
+ * Signature and certificate bytes are located, never verified.
+ */
+export const qualcommMbnMetadataSchema = z.strictObject({
+  kind: z.literal("qualcomm-mbn"),
+  layout: z.enum(["legacy", "elf"]),
+  header: z
+    .strictObject({
+      version: z.union([z.literal(3), z.literal(5), z.literal(6)]),
+      header_bytes: z.union([z.literal(40), z.literal(48)]),
+      image_id: uint32,
+      image_source: uint32.nullable(),
+      image_source_name: z
+        .enum(["nand", "nor", "emmc", "emmc-user"])
+        .nullable(),
+      image_destination: uint32.nullable(),
+      image_size: uint32,
+      code_size: uint32,
+      signature_pointer: uint32,
+      signature_size: uint32,
+      certificate_chain_pointer: uint32,
+      certificate_chain_size: uint32,
+      metadata0_size: uint32.nullable(),
+      qti_signature_size: uint32.nullable(),
+      metadata1_size: uint32.nullable(),
+      qti_certificate_chain_size: uint32.nullable(),
+      ranges: z.strictObject({
+        header: qualcommMbnRangeSchema,
+        code: qualcommMbnRangeSchema,
+        signature: qualcommMbnRangeSchema,
+        certificate_chain: qualcommMbnRangeSchema,
+        qti_signature: qualcommMbnRangeSchema.nullable(),
+        qti_certificate_chain: qualcommMbnRangeSchema.nullable(),
+        metadata0: qualcommMbnRangeSchema.nullable(),
+        metadata1: qualcommMbnRangeSchema.nullable(),
+      }),
+    })
+    .nullable(),
+  elf: z
+    .strictObject({
+      elf_class: z.union([z.literal(32), z.literal(64)]),
+      byte_order: z.enum(["little", "big"]),
+      machine: uint16,
+      program_header_count: uint16.nullable(),
+      hash_segment_program_header: uint16.nullable(),
+      hash_segment_offset: offset.nullable(),
+      hash_segment_file_size: offset.nullable(),
+      hash_size: z
+        .union([z.literal(20), z.literal(32), z.literal(48)])
+        .nullable(),
+      hash_count: offset.nullable(),
+      /** The first rows; the hash table region holds every hash. */
+      segment_hashes: z
+        .array(
+          z.strictObject({
+            program_header: uint16,
+            segment_type: uint8,
+            file_offset: offset.nullable(),
+            file_size: offset.nullable(),
+            hash_offset: offset,
+          }),
+        )
+        .max(QUALCOMM_MBN_INLINE_SEGMENT_HASH_LIMIT),
+      omitted_segment_hashes: offset,
+    })
+    .nullable(),
+});
+export type QualcommMbnMetadata = z.infer<typeof qualcommMbnMetadataSchema>;
